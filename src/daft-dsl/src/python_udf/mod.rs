@@ -128,3 +128,37 @@ pub fn collect_operator_metrics(
         }
     }
 }
+
+/// Records the `udf.errors` / `udf.error_rows` counters for failures that `on_error`
+/// turned into nulls instead of propagating.
+///
+/// `num_invocations` counts UDF calls that failed, `num_rows` counts the rows those
+/// calls nulled out. The two differ for batch and async UDFs, where a single failure
+/// nulls the whole batch.
+#[cfg(feature = "python")]
+pub(crate) fn record_suppressed_errors(
+    metrics: &mut dyn crate::operator_metrics::MetricsCollector,
+    function_name: &str,
+    num_invocations: u64,
+    num_rows: u64,
+) {
+    if num_invocations == 0 {
+        return;
+    }
+
+    let attributes =
+        std::collections::HashMap::from([("function".to_string(), function_name.to_string())]);
+
+    metrics.inc_counter(
+        common_metrics::UDF_ERRORS_KEY,
+        num_invocations,
+        Some("Number of Python UDF invocations suppressed by on_error"),
+        Some(attributes.clone()),
+    );
+    metrics.inc_counter(
+        common_metrics::UDF_ERROR_ROWS_KEY,
+        num_rows,
+        Some("Number of rows emitted as null by suppressed Python UDF invocations"),
+        Some(attributes),
+    );
+}

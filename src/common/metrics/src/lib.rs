@@ -125,6 +125,10 @@ pub const ROWS_IN_KEY: &str = "rows.in";
 pub const ROWS_OUT_KEY: &str = "rows.out";
 pub const ROWS_WRITTEN_KEY: &str = "rows.written";
 
+// UDF metrics
+pub const UDF_ERRORS_KEY: &str = "udf.errors";
+pub const UDF_ERROR_ROWS_KEY: &str = "udf.error_rows";
+
 // Checkpoint metrics
 pub const CHECKPOINT_FILES_STAGED_KEY: &str = "checkpoint.files_staged";
 pub const CHECKPOINTS_SEALED_KEY: &str = "checkpoint.sealed";

@@ -194,8 +194,14 @@ impl RowWisePyFn {
             (Ok((result_series, _)), _) => Ok(result_series.cast(&self.return_dtype)?.rename(name)),
             (Err(err), OnError::Raise) => Err(err),
             (Err(err), OnError::Log) => {
+                // An async morsel fails as a unit, so one invocation nulls every row.
+                crate::python_udf::record_suppressed_errors(
+                    metrics,
+                    &self.function_name,
+                    1,
+                    num_rows as u64,
+                );
                 log::warn!("Python UDF error: {}", err);
-                let num_rows = args.iter().map(Series::len).max().unwrap();
 
                 let logger_provider = common_tracing::GLOBAL_LOGGER_PROVIDER.lock().unwrap();
                 if let Some(logger_provider) = logger_provider.as_ref() {
@@ -216,7 +222,12 @@ impl RowWisePyFn {
                 Ok(Series::full_null(name, &self.return_dtype, num_rows))
             }
             (Err(_), OnError::Ignore) => {
-                let num_rows = args.iter().map(Series::len).max().unwrap();
+                crate::python_udf::record_suppressed_errors(
+                    metrics,
+                    &self.function_name,
+                    1,
+                    num_rows as u64,
+                );
                 Ok(Series::full_null(name, &self.return_dtype, num_rows))
             }
         }
@@ -326,7 +337,11 @@ impl RowWisePyFn {
         let on_error = self.on_error;
         let max_retries = self.max_retries.unwrap_or(0);
 
-        let s = Python::attach(|py| {
+        // Each row is its own invocation here, so tally them up and record the counters
+        // once rather than reaching into the counter map on every failing row.
+        let mut suppressed = 0u64;
+
+        let result = Python::attach(|py| {
             let func = py
                 .import(pyo3::intern!(py, "daft.udf.execution"))?
                 .getattr(pyo3::intern!(py, "call_func"))?;
@@ -370,6 +385,7 @@ impl RowWisePyFn {
                     Err(e) => match on_error {
                         OnError::Raise => Err(e),
                         OnError::Log => {
+                            suppressed += 1;
                             let lg = common_tracing::GLOBAL_LOGGER_PROVIDER.lock().unwrap();
                             if let Some(logger_provider) = lg.as_ref() {
                                 let logger = logger_provider.logger("python-udf-error");
@@ -419,7 +435,10 @@ impl RowWisePyFn {
                             log::warn!("Python UDF error: {}", e);
                             Ok(Literal::Null)
                         }
-                        OnError::Ignore => Ok(Literal::Null),
+                        OnError::Ignore => {
+                            suppressed += 1;
+                            Ok(Literal::Null)
+                        }
                     },
                 };
 
@@ -427,10 +446,16 @@ impl RowWisePyFn {
                 final_res
             });
             series_from_literals_iter(iter, Some(self.return_dtype.clone()))
-        })?
-        .rename(name);
+        });
 
-        Ok(s)
+        crate::python_udf::record_suppressed_errors(
+            metrics,
+            &self.function_name,
+            suppressed,
+            suppressed,
+        );
+
+        Ok(result?.rename(name))
     }
 
     #[cfg(feature = "python")]

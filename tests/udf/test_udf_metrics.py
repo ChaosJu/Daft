@@ -179,6 +179,155 @@ def test_increment_counter_rejects_invalid_attribute_value() -> None:
         metrics.increment_counter("bad value", attributes={"key": 1})  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("on_error", ["log", "ignore"])
+@pytest.mark.parametrize("is_batch", [False, True])
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("use_process", [False, True])
+def test_udf_error_metrics(on_error: str, is_batch: bool, is_async: bool, use_process: bool) -> None:
+    def fail(_value: Any) -> int:
+        raise ValueError("UDF failed")
+
+    impl = _wrap_async(fail) if is_async else fail
+    if is_batch:
+        udf = daft.func.batch(return_dtype=DataType.int64(), on_error=on_error, use_process=use_process)(impl)
+    else:
+        udf = daft.func(on_error=on_error, use_process=use_process)(impl)
+
+    df = daft.from_pydict({"value": [1, 2, 3]}).select(udf(daft.col("value")))
+    df.collect()
+
+    assert df.to_pydict() == {"value": [None, None, None]}
+    assert _find_udf_stats(df.metrics, "udf.error_rows") == 3
+
+    # Batch UDFs fail per call. Async row-wise UDFs currently fail the whole
+    # morsel together (asyncio.gather without return_exceptions), so one
+    # exception also counts as a single invocation. The sync row-wise path
+    # fails one row at a time.
+    expected_errors = 1 if (is_batch or is_async) else 3
+    assert _find_udf_stats(df.metrics, "udf.errors") == expected_errors
+
+
+@pytest.mark.parametrize("on_error", ["log", "ignore"])
+def test_udf_error_metrics_partial_failure(on_error: str) -> None:
+    @daft.func(on_error=on_error)
+    def fail_on_two(value: int) -> int:
+        if value == 2:
+            raise ValueError("UDF failed")
+        return value * 10
+
+    df = daft.from_pydict({"value": [1, 2, 3]}).select(fail_on_two(daft.col("value")))
+    df.collect()
+
+    assert df.to_pydict() == {"value": [10, None, 30]}
+    assert _find_udf_stats(df.metrics, "udf.errors") == 1
+    assert _find_udf_stats(df.metrics, "udf.error_rows") == 1
+
+
+@pytest.mark.parametrize("is_batch", [False, True])
+def test_udf_error_metrics_absent_when_nothing_fails(is_batch: bool) -> None:
+    if is_batch:
+
+        def batch_identity(values: Series) -> Series:
+            return values
+
+        udf = daft.func.batch(return_dtype=DataType.int64(), on_error="raise")(batch_identity)
+    else:
+
+        def identity(value: int) -> int:
+            return value
+
+        udf = daft.func(on_error="raise")(identity)
+
+    df = daft.from_pydict({"value": [1, 2, 3]}).select(udf(daft.col("value")))
+    df.collect()
+
+    assert _find_udf_stats(df.metrics, "udf.errors") is None
+    assert _find_udf_stats(df.metrics, "udf.error_rows") is None
+
+
+@pytest.mark.parametrize("is_batch", [False, True])
+def test_udf_error_metrics_absent_when_on_error_raise(is_batch: bool) -> None:
+    def fail(_value: Any) -> int:
+        raise ValueError("UDF failed")
+
+    if is_batch:
+        udf = daft.func.batch(return_dtype=DataType.int64(), on_error="raise")(fail)
+    else:
+        udf = daft.func(on_error="raise")(fail)
+
+    df = daft.from_pydict({"value": [1, 2, 3]}).select(udf(daft.col("value")))
+    with pytest.raises(Exception, match="UDF failed"):
+        df.collect()
+
+    # Raise must not take the suppress-and-count path. Failed queries often
+    # never publish operator metrics; if they do, the counters must be absent.
+    try:
+        result_metrics = df.metrics
+    except ValueError:
+        return
+    if result_metrics is None:
+        return
+    assert _find_udf_stats(result_metrics, "udf.errors") is None
+    assert _find_udf_stats(result_metrics, "udf.error_rows") is None
+
+
+def test_udf_error_metrics_excludes_successful_retries() -> None:
+    attempts = 0
+
+    @daft.func.batch(return_dtype=DataType.int64(), on_error="ignore", max_retries=1)
+    def succeed_on_retry(values: Series) -> Series:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValueError("transient failure")
+        return values
+
+    df = daft.from_pydict({"value": [1, 2, 3]}).select(succeed_on_retry(daft.col("value")))
+    df.collect()
+
+    # The retry succeeded, so the rows survive and nothing is counted as an error.
+    assert attempts == 2
+    assert df.to_pydict() == {"value": [1, 2, 3]}
+    assert _find_udf_stats(df.metrics, "udf.errors") is None
+    assert _find_udf_stats(df.metrics, "udf.error_rows") is None
+
+
+def test_udf_error_metrics_counted_once_when_retries_exhausted() -> None:
+    attempts = 0
+
+    @daft.func.batch(return_dtype=DataType.int64(), on_error="ignore", max_retries=2)
+    def always_fail(values: Series) -> Series:
+        nonlocal attempts
+        attempts += 1
+        raise ValueError("permanent failure")
+
+    df = daft.from_pydict({"value": [1, 2, 3]}).select(always_fail(daft.col("value")))
+    df.collect()
+
+    # Three attempts, but the failure is only counted once it is actually suppressed.
+    assert attempts == 3
+    assert _find_udf_stats(df.metrics, "udf.errors") == 1
+    assert _find_udf_stats(df.metrics, "udf.error_rows") == 3
+
+
+@pytest.mark.parametrize("concurrency", [None, 1])
+def test_udf_error_metrics_cls(concurrency: int | None) -> None:
+    if concurrency is not None and get_tests_daft_runner_name() == "ray":
+        pytest.skip("Ray runner does not support UDF metrics for actor-based UDFs")
+
+    @daft.cls(max_concurrency=concurrency, on_error="ignore")
+    class FailingUdf:
+        def __call__(self, value: int) -> int:
+            raise ValueError("UDF failed")
+
+    df = daft.from_pydict({"value": [1, 2, 3]}).select(FailingUdf()(daft.col("value")))
+    df.collect()
+
+    assert df.to_pydict() == {"value": [None, None, None]}
+    assert _find_udf_stats(df.metrics, "udf.errors") == 3
+    assert _find_udf_stats(df.metrics, "udf.error_rows") == 3
+
+
 @pytest.mark.parametrize("num_udfs", [1, 2])
 @pytest.mark.parametrize("batch_size", [None, 1, 4])
 @pytest.mark.parametrize("use_process", [False, True])

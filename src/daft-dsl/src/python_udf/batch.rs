@@ -121,6 +121,18 @@ impl BatchPyFn {
         }
     }
 
+    /// A failed batch call nulls out every row it was given, so one invocation
+    /// accounts for `num_rows` error rows.
+    #[cfg(feature = "python")]
+    fn record_suppressed_error(&self, metrics: &mut dyn MetricsCollector, num_rows: usize) {
+        crate::python_udf::record_suppressed_errors(
+            metrics,
+            &self.function_name,
+            1,
+            num_rows as u64,
+        );
+    }
+
     #[cfg(feature = "python")]
     pub fn call(
         &self,
@@ -166,15 +178,15 @@ impl BatchPyFn {
             (Ok((result_series, _)), _) => Ok(result_series.cast(&self.return_dtype)?.rename(name)),
             (Err(err), OnError::Raise) => Err(err),
             (Err(err), OnError::Log) => {
-                log::warn!("Python UDF error: {}", err);
-                // todo: log error
                 let num_rows = args.iter().map(Series::len).max().unwrap();
+                self.record_suppressed_error(metrics_collector, num_rows);
+                log::warn!("Python UDF error: {}", err);
 
-                // log::error!("Python UDF error: {}", err);
                 Ok(Series::full_null(name, &self.return_dtype, num_rows))
             }
             (Err(_), OnError::Ignore) => {
                 let num_rows = args.iter().map(Series::len).max().unwrap();
+                self.record_suppressed_error(metrics_collector, num_rows);
                 Ok(Series::full_null(name, &self.return_dtype, num_rows))
             }
         }
@@ -212,12 +224,14 @@ impl BatchPyFn {
             (Ok((result_series, _)), _) => Ok(result_series.cast(&self.return_dtype)?.rename(name)),
             (Err(err), OnError::Raise) => Err(err),
             (Err(err), OnError::Log) => {
-                log::warn!("Python UDF error: {}", err);
                 let num_rows = args.iter().map(Series::len).max().unwrap();
+                self.record_suppressed_error(metrics, num_rows);
+                log::warn!("Python UDF error: {}", err);
                 Ok(Series::full_null(name, &self.return_dtype, num_rows))
             }
             (Err(_), OnError::Ignore) => {
                 let num_rows = args.iter().map(Series::len).max().unwrap();
+                self.record_suppressed_error(metrics, num_rows);
                 Ok(Series::full_null(name, &self.return_dtype, num_rows))
             }
         }

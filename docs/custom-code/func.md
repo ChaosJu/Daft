@@ -451,6 +451,21 @@ Control what happens when a function invocation raises an exception.
     - `"log"` — log the exception and emit `None` for that invocation.
     - `"ignore"` — silently emit `None` for that invocation.
 
+When `"log"` or `"ignore"` emits `None`, Daft records two operator counters:
+
+- `udf.errors` — the number of invocations that failed.
+- `udf.error_rows` — the number of rows those invocations emitted as `None`.
+
+The two are equal for synchronous `@daft.func`, which fails one row at a time. They differ for `@daft.func.batch` and for async functions, where a single failure nulls out the entire batch: one invocation can produce thousands of error rows. Use `udf.error_rows` to reason about null rates and `udf.errors` to reason about how often the function itself failed.
+
+Both counters are available through `DataFrame.metrics` and any configured OpenTelemetry exporter. Errors recovered by a retry are not counted.
+
+OpenTelemetry exports include a `function` attribute with the function name, so a metrics backend can break failures down per function. `DataFrame.metrics` does not carry attributes: when several functions are fused into one operator it reports only their combined totals.
+
+!!! warning "Not reported for actor UDFs on Ray"
+
+    UDF metrics are dropped for `@daft.cls` functions with `max_concurrency` set when running on the Ray runner, because the Ray actor pool does not return operator metrics to the caller. The `udf.errors` and `udf.error_rows` keys are absent from `DataFrame.metrics` in that case, which is indistinguishable from a run with no failures.
+
 ## Advanced Features
 
 ### Unnesting Struct Returns
